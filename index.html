@@ -729,6 +729,45 @@
     color: var(--danger);
     font-family: 'JetBrains Mono', monospace;
   }
+
+  /* PROXY TOGGLE */
+  .proxy-toggle {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 4px 10px;
+    cursor: pointer;
+    transition: border-color 0.15s;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    user-select: none;
+  }
+  .proxy-toggle:hover { border-color: var(--text-muted); color: var(--text-primary); }
+  .proxy-toggle.on { border-color: var(--border-accent); background: var(--accent-dim); color: var(--accent); }
+
+  .toggle-switch {
+    width: 28px; height: 15px;
+    background: var(--border);
+    border-radius: 10px;
+    position: relative;
+    transition: background 0.2s;
+    flex-shrink: 0;
+  }
+  .toggle-switch::after {
+    content: '';
+    position: absolute;
+    width: 11px; height: 11px;
+    background: var(--text-muted);
+    border-radius: 50%;
+    top: 2px; left: 2px;
+    transition: transform 0.2s, background 0.2s;
+  }
+  .proxy-toggle.on .toggle-switch { background: var(--accent-dim); }
+  .proxy-toggle.on .toggle-switch::after { transform: translateX(13px); background: var(--accent); }
 </style>
 </head>
 <body>
@@ -742,6 +781,10 @@
   <div style="width:1px;height:24px;background:var(--border);margin:0 4px;"></div>
   <span style="font-size:11px;color:var(--text-muted);">API Client</span>
   <div style="margin-left:auto;display:flex;gap:8px;align-items:center;">
+    <div class="proxy-toggle" id="proxy-toggle" onclick="toggleProxy()" title="Route requests through a CORS proxy to bypass browser restrictions">
+      <div class="toggle-switch"></div>
+      CORS Proxy
+    </div>
     <button class="copy-btn" onclick="clearHistory()" title="Clear History"><i class="bi bi-trash"></i> Clear History</button>
     <div class="env-badge" onclick="toggleEnvModal()"><i class="bi bi-braces"></i> ENV</div>
   </div>
@@ -976,6 +1019,8 @@ document.addEventListener('DOMContentLoaded', () => {
   addKvRow('params-body', 'params');
   addKvRow('headers-body', 'headers');
   initResizer();
+  // Restore proxy state
+  if (corsProxyEnabled) document.getElementById('proxy-toggle').classList.add('on');
 });
 
 // ============================================================
@@ -1173,6 +1218,33 @@ function saveEnvVars() {
 }
 
 // ============================================================
+//  CORS PROXY TOGGLE
+// ============================================================
+let corsProxyEnabled = localStorage.getItem('volt-proxy') === 'true';
+
+function toggleProxy() {
+  corsProxyEnabled = !corsProxyEnabled;
+  localStorage.setItem('volt-proxy', corsProxyEnabled);
+  const el = document.getElementById('proxy-toggle');
+  el.classList.toggle('on', corsProxyEnabled);
+  toast(corsProxyEnabled ? 'CORS Proxy ON — requests routed via proxy' : 'CORS Proxy OFF — direct requests', corsProxyEnabled ? 'bi-shield-check' : 'bi-shield-x');
+}
+
+// Available CORS proxies, tried in order
+const CORS_PROXIES = [
+  url => `https://corsproxy.io/?${encodeURIComponent(url)}`,
+  url => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+
+  url => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+  url => `https://cors.isomorphic-git.org/${encodeURIComponent(url)}`,
+];
+
+// Wraps the target URL through a proxy
+function applyProxy(url, proxyIndex = 0) {
+  return CORS_PROXIES[proxyIndex](url);
+}
+
+// ============================================================
 //  SEND REQUEST
 // ============================================================
 async function sendRequest() {
@@ -1233,29 +1305,67 @@ async function sendRequest() {
     }
   }
 
-  // Show loading
   setLoadingState(true);
   const startTime = performance.now();
 
-  try {
-    const fetchOptions = { method, headers, body };
+  // Try direct first; if CORS error and proxy is off, auto-suggest; if proxy on, use it
+  const result = await attemptFetch(finalUrl, method, headers, body, startTime);
 
-    const response = await fetch(finalUrl, fetchOptions);
+  if (result.corsBlocked && !corsProxyEnabled) {
+    // Auto-retry with proxy, silently
+    setLoadingState(true);
+    const proxyResult = await attemptFetch(finalUrl, method, headers, body, startTime, true);
+    if (!proxyResult.corsBlocked && !proxyResult.error) {
+      // Proxy worked — enable it automatically
+      if (!corsProxyEnabled) {
+        corsProxyEnabled = true;
+        localStorage.setItem('volt-proxy', 'true');
+        document.getElementById('proxy-toggle').classList.add('on');
+        toast('CORS detected — Proxy auto-enabled ✓', 'bi-shield-check');
+      }
+      finishResponse(proxyResult, finalUrl, method);
+    } else {
+      setLoadingState(false);
+      displayError(result.error + '\n\nAutomatic proxy also failed. The server may be down or blocking all external requests.');
+      saveToHistory({ method, url: finalUrl, status: 'ERR', elapsed: result.elapsed, timestamp: Date.now() });
+    }
+  } else if (result.error) {
+    setLoadingState(false);
+    displayError(result.error);
+    saveToHistory({ method, url: finalUrl, status: 'ERR', elapsed: result.elapsed, timestamp: Date.now() });
+  } else {
+    finishResponse(result, finalUrl, method);
+  }
+}
+
+function finishResponse(result, finalUrl, method) {
+  saveToHistory({ method, url: finalUrl, status: result.status, elapsed: result.elapsed, timestamp: Date.now() });
+  displayResponse(result);
+}
+
+async function attemptFetch(targetUrl, method, headers, body, startTime, useProxy = false) {
+  let fetchUrl = targetUrl;
+  let fetchHeaders = { ...headers };
+
+  if (useProxy || corsProxyEnabled) {
+    // When using proxy for non-GET, prefer corsproxy.io which supports full methods
+    fetchUrl = applyProxy(targetUrl, 0);
+    // corsproxy.io passes through body and headers correctly
+  }
+
+  try {
+    const response = await fetch(fetchUrl, { method, headers: fetchHeaders, body });
     const elapsed = Math.round(performance.now() - startTime);
     const contentType = response.headers.get('content-type') || '';
     const responseText = await response.text();
 
-    let responseData;
-    try { responseData = JSON.parse(responseText); } catch { responseData = null; }
+    let responseData = null;
+    try { responseData = JSON.parse(responseText); } catch {}
 
     const respHeaders = {};
     response.headers.forEach((val, key) => { respHeaders[key] = val; });
 
-    // Store to history
-    saveToHistory({ method, url: finalUrl, status: response.status, elapsed, timestamp: Date.now() });
-
-    // Display
-    displayResponse({
+    return {
       status: response.status,
       statusText: response.statusText,
       elapsed,
@@ -1263,14 +1373,19 @@ async function sendRequest() {
       headers: respHeaders,
       rawBody: responseText,
       jsonBody: responseData,
-      contentType
-    });
-
+      contentType,
+      corsBlocked: false,
+      error: null
+    };
   } catch (err) {
     const elapsed = Math.round(performance.now() - startTime);
-    setLoadingState(false);
-    displayError(err.message);
-    saveToHistory({ method, url: finalUrl, status: 'ERR', elapsed, timestamp: Date.now() });
+    const isCors = err.message.includes('Failed to fetch') || err.message.includes('NetworkError') || err.message.includes('CORS') || err.name === 'TypeError';
+    return {
+      corsBlocked: isCors && !useProxy && !corsProxyEnabled,
+      error: err.message,
+      elapsed,
+      status: 'ERR'
+    };
   }
 }
 
@@ -1349,7 +1464,7 @@ function displayError(msg) {
   document.getElementById('resp-tabs').style.display = 'none';
   document.getElementById('resp-view-toggle').style.display = 'none';
   document.getElementById('resp-body-tab').style.display = '';
-  document.getElementById('resp-pretty').innerHTML = `<div class="error-banner"><i class="bi bi-exclamation-circle me-2"></i>${escapeHtml(msg)}<br><br><span style="color:var(--text-muted);">This may be a CORS issue. Try using a CORS proxy or server-side requests.</span></div>`;
+  document.getElementById('resp-pretty').innerHTML = `<div class="error-banner"><i class="bi bi-exclamation-circle"></i> &nbsp;${escapeHtml(msg)}</div>`;
   document.getElementById('resp-raw').style.display = 'none';
   document.getElementById('resp-pretty').style.display = '';
 }
